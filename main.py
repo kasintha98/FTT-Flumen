@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 import paho.mqtt.client as mqtt
 from scipy import signal
 import time
+import sys
 
 # -------- CONFIG --------
 MQTT_BROKER = "dev.flumina.de"
@@ -13,192 +14,173 @@ MQTT_TOPIC = "root/acc_fifo_batch"
 MAX_POINTS = 800
 SAMPLE_RATE = 800
 
-# -------- GLOBAL BUFFERS --------
-# We use standard global variables for data buffering because
-# they are thread-safe enough for this use case and avoid
-# Streamlit context errors in background threads.
-data_x = collections.deque(maxlen=MAX_POINTS)
-data_y = collections.deque(maxlen=MAX_POINTS)
-data_z = collections.deque(maxlen=MAX_POINTS)
-connection_state = {"status": "Connecting...", "code": None}
-
 # -------- PAGE CONFIG --------
-st.set_page_config(
-    page_title="Real-Time Vibration Monitor",
-    layout="wide",
-    initial_sidebar_state="collapsed"
-)
-
+st.set_page_config(page_title="Vibration Monitor", layout="wide")
 st.title("🔴 Live Vibration Dashboard")
-status_placeholder = st.empty()  # Placeholder for connection status
-plot_placeholder = st.empty()  # Placeholder for the charts
 
 
-# -------- MQTT CALLBACKS (NO STREAMLIT CALLS HERE) --------
+# -------- SHARED STATE CLASS --------
+# This class lives in the memory and is shared between the MQTT thread
+# and the Streamlit main loop.
+class SharedState:
+    def __init__(self):
+        self.x_buf = collections.deque(maxlen=MAX_POINTS)
+        self.y_buf = collections.deque(maxlen=MAX_POINTS)
+        self.z_buf = collections.deque(maxlen=MAX_POINTS)
+        self.status = "Disconnected"
+        self.message_count = 0
+        self.last_update = time.time()
+        self.logs = collections.deque(maxlen=10)  # Keep last 10 logs
+
+    def log(self, msg):
+        timestamp = time.strftime("%H:%M:%S")
+        self.logs.append(f"[{timestamp}] {msg}")
+        print(f"LOG: {msg}")
+
+
+# Use @st.cache_resource so this object is created ONLY ONCE and never reset
+@st.cache_resource
+def get_shared_state():
+    return SharedState()
+
+
+state = get_shared_state()
+
+
+# -------- MQTT CALLBACKS --------
 def on_connect(client, userdata, flags, reason_code, properties):
-    # Update global variable only, do not call st. functions here
     if reason_code == 0:
-        connection_state["status"] = "Connected"
+        state.status = "Connected"
+        state.log("Connected to Broker! Subscribing...")
         client.subscribe(MQTT_TOPIC)
     else:
-        connection_state["status"] = f"Failed to connect: {reason_code}"
+        state.status = f"Failed: {reason_code}"
+        state.log(f"Connection failed code: {reason_code}")
 
 
 def on_message(client, userdata, msg):
     try:
-        data = json.loads(msg.payload.decode())
+        # Update heartbeat
+        state.last_update = time.time()
+        state.message_count += 1
+
+        payload = msg.payload.decode()
+        data = json.loads(payload)
+
         new_x, new_y, new_z = [], [], []
 
-        # Handle List format
-        if isinstance(data, list):
-            for batch in data:
-                samples = batch.get("s", [])
-                for s in samples:
-                    new_x.append(s[0])
-                    new_y.append(s[1])
-                    new_z.append(s[2])
-        # Handle Dict format
-        elif isinstance(data, dict) and "s" in data:
-            samples = data.get("s", [])
+        # Helper to extract points
+        def extract(samples):
             for s in samples:
                 new_x.append(s[0])
                 new_y.append(s[1])
                 new_z.append(s[2])
 
-        # Extend global buffers
-        data_x.extend(new_x)
-        data_y.extend(new_y)
-        data_z.extend(new_z)
+        # Handle List format or Dict format
+        if isinstance(data, list):
+            for batch in data:
+                extract(batch.get("s", []))
+        elif isinstance(data, dict) and "s" in data:
+            extract(data.get("s", []))
+
+        # Push to shared state
+        state.x_buf.extend(new_x)
+        state.y_buf.extend(new_y)
+        state.z_buf.extend(new_z)
 
     except Exception as e:
-        print(f"Parse error: {e}")
+        state.log(f"Parse Error: {e}")
 
 
-# -------- SETUP MQTT --------
-# Helper to cache the client setup so we don't reconnect on every rerun
+# -------- START MQTT --------
 @st.cache_resource
-def start_mqtt_client():
-    # generating unique ID
-    client_id = f"streamlit_client_{int(time.time())}"
-    # Updated to CallbackAPIVersion.VERSION2 to fix deprecation warning
-    client = mqtt.Client(client_id=client_id, callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
+def start_mqtt():
+    state = get_shared_state()
+    client_id = f"streamlit_vib_{int(time.time())}"
+
+    # Try creating client (Handle both Paho v1 and v2)
+    try:
+        client = mqtt.Client(client_id=client_id, callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
+    except AttributeError:
+        # Fallback for older Paho versions
+        client = mqtt.Client(client_id=client_id)
 
     client.on_connect = on_connect
     client.on_message = on_message
 
+    state.log(f"Connecting to {MQTT_BROKER}...")
     try:
         client.connect(MQTT_BROKER, 1883, 60)
-        client.loop_start()  # Run in background thread
+        client.loop_start()
         return client
     except Exception as e:
+        state.log(f"Connection Error: {e}")
+        state.status = "Error"
         return None
 
 
-# Start Client
-client = start_mqtt_client()
+# Start the client (only runs once due to cache_resource)
+client = start_mqtt()
 
-# -------- MAIN UI LOOP --------
-run_app = st.checkbox('Start Live Feed', value=True)
+# -------- DASHBOARD LAYOUT --------
+col1, col2, col3 = st.columns(3)
+status_indicator = col1.empty()
+msg_counter = col2.empty()
+debug_expander = st.sidebar.expander("Debug Console", expanded=True)
+debug_text = debug_expander.empty()
 
-while run_app:
-    # 1. Update Status
-    if connection_state["status"] == "Connected":
-        status_placeholder.success(f"MQTT Status: {connection_state['status']}")
+plot_placeholder = st.empty()
+
+# -------- MAIN LOOP --------
+st.sidebar.text("Press 'Stop' in top right to kill script")
+
+# We loop here to update the charts
+while True:
+    # 1. Update Diagnostics
+    if state.status == "Connected":
+        status_indicator.success(f"Status: {state.status}")
     else:
-        status_placeholder.warning(f"MQTT Status: {connection_state['status']}")
+        status_indicator.warning(f"Status: {state.status}")
 
-    # 2. Check if we have data
-    if len(data_x) > 0:
-        # Create local copies of data to avoid threading race conditions during plotting
-        x_buf = list(data_x)
-        y_buf = list(data_y)
-        z_buf = list(data_z)
+    msg_counter.metric("Messages Received", state.message_count)
+    debug_text.code("\n".join(list(state.logs)[::-1]))  # Show logs in sidebar
 
-        # Create figure
-        fig = plt.figure(figsize=(14, 10))
-        gs = fig.add_gridspec(3, 2, hspace=0.3, wspace=0.3)
-        ax1 = fig.add_subplot(gs[0, :])
-        ax2 = fig.add_subplot(gs[1, 0])
-        ax3 = fig.add_subplot(gs[1, 1])
-        ax4 = fig.add_subplot(gs[2, :])
+    # 2. Check Data & Plot
+    if len(state.x_buf) > 10:
+        # Copy data safely
+        x_data = list(state.x_buf)
+        y_data = list(state.y_buf)
+        z_data = list(state.z_buf)
 
-        # --- Plot 1: Time Domain ---
-        ax1.plot(x_buf, label="X", lw=1)
-        ax1.plot(y_buf, label="Y", lw=1)
-        ax1.plot(z_buf, label="Z", lw=1)
-        ax1.set_title("ADXL FIFO data (real-time)")
-        ax1.set_ylabel("mg")
-        ax1.legend(loc='upper right')
+        fig = plt.figure(figsize=(10, 8))
+        gs = fig.add_gridspec(2, 1, hspace=0.3)
+        ax1 = fig.add_subplot(gs[0])
+        ax2 = fig.add_subplot(gs[1])
+
+        # Plot Time Domain
+        ax1.plot(x_data, label="X", lw=1)
+        ax1.plot(y_data, label="Y", lw=1)
+        ax1.plot(z_data, label="Z", lw=1)
+        ax1.set_title(f"Live Data ({len(x_data)} points)")
         ax1.grid(True)
+        ax1.legend(loc="upper right")
 
-        # --- Compute FFT ---
-        if len(x_buf) >= 64:
-            x_arr = np.array(x_buf)
-            y_arr = np.array(y_buf)
-            z_arr = np.array(z_buf)
-
-            # FFT Calculation
-            fft_x_data = np.fft.rfft(x_arr)
-            fft_y_data = np.fft.rfft(y_arr)
-            fft_z_data = np.fft.rfft(z_arr)
-            mag_x = np.abs(fft_x_data)
-            mag_y = np.abs(fft_y_data)
-            mag_z = np.abs(fft_z_data)
+        # Plot FFT
+        if len(x_data) >= 64:
+            x_arr = np.array(x_data)
             freqs = np.fft.rfftfreq(len(x_arr), 1 / SAMPLE_RATE)
+            mag_x = np.abs(np.fft.rfft(x_arr))
 
-            # --- Plot 2: FFT ---
-            ax2.plot(freqs, mag_x, label="X", alpha=0.7)
-            ax2.plot(freqs, mag_y, label="Y", alpha=0.7)
-            ax2.plot(freqs, mag_z, label="Z", alpha=0.7)
-            ax2.set_title("FFT Magnitude Spectrum (0-60 Hz)")
+            ax2.plot(freqs, mag_x, color='blue', alpha=0.7)
+            ax2.set_title("FFT (X-Axis)")
             ax2.set_xlim(0, 60)
             ax2.grid(True)
 
-
-            # --- Plot 3: Harmonics ---
-            def find_top_harmonics(mag, freqs, n_peaks=5):
-                mask = freqs <= 60
-                mag_filtered = mag[mask]
-                freqs_filtered = freqs[mask]
-                if len(mag_filtered) == 0: return np.array([]), np.array([])
-
-                peaks, properties = signal.find_peaks(mag_filtered, height=np.max(mag_filtered) * 0.1)
-                if len(peaks) > 0:
-                    top_indices = np.argsort(properties['peak_heights'])[-n_peaks:][::-1]
-                    top_peaks = peaks[top_indices]
-                    return freqs_filtered[top_peaks], mag_filtered[top_peaks]
-                return np.array([]), np.array([])
-
-
-            hx, hy = find_top_harmonics(mag_x, freqs)
-            ax3.plot(hx, hy, 'o-', label="X Peaks", markersize=8)
-            ax3.set_title("Top 5 Harmonics (X-axis)")
-            ax3.set_xlabel("Frequency (Hz)")
-            ax3.legend()
-            ax3.grid(True)
-
-            # --- Plot 4: Spectrogram ---
-            if len(z_buf) >= 256:
-                f, t, Sxx = signal.spectrogram(z_arr, SAMPLE_RATE, nperseg=128, noverlap=64)
-                freq_mask = f <= 60
-
-                # Sxx might be empty or small, handle safely
-                if Sxx.size > 0:
-                    pcm = ax4.pcolormesh(t, f[freq_mask], 10 * np.log10(Sxx[freq_mask, :] + 1e-10),
-                                         shading='gouraud', cmap='viridis')
-                    ax4.set_title("Spectrogram (Z-axis, 0-60 Hz)")
-                    ax4.set_ylabel("Frequency (Hz)")
-                    ax4.set_ylim(0, 60)
-                    try:
-                        fig.colorbar(pcm, ax=ax4, label="dB")
-                    except:
-                        pass
-
-        # Push the plot to the placeholder
         plot_placeholder.pyplot(fig)
-
-        # Clean up memory
         plt.close(fig)
+    else:
+        # Show waiting message if connected but no data yet
+        if state.status == "Connected":
+            plot_placeholder.info("Connected! Waiting for data stream...")
 
-    # Small sleep to prevent CPU overload
     time.sleep(0.5)
